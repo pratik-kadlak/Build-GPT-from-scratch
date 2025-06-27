@@ -1,18 +1,22 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from tqdm import tqdm
 
 
 # hyper-parameters
-batch_size = 32
-block_size = 8
+batch_size = 64  # how many independent sequence will be run in paraller
+block_size = 256 # what is the max context length for predictions
 max_iters = 5000
-eval_interval = 300
-learning_rate = 1e-3
+eval_interval = 500
+learning_rate = 3e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 device = 'mps' if torch.backends.mps.is_available() else 'cpu'
 eval_iters = 200
-n_emb = 32 # dim of embedding 
+n_emb = 384 # dim of embedding 
+n_head = 6
+n_layer = 6
+dropout = 0.2
 # --------------------------------------------------------------
 
 
@@ -77,6 +81,7 @@ class Head(nn.Module):
         self.query = nn.Linear(n_emb, head_size, bias=False)
         self.value = nn.Linear(n_emb, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
 
     
     def forward(self, x):
@@ -87,6 +92,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C**-0.5 # (BxTxC) . (BxCxT) -> (BxTxT)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
         v = self.value(x)
         out = wei @ v
         return out
@@ -98,10 +104,14 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
         self.proj = nn.Linear(n_emb, n_emb)
+        self.dropout = nn.Dropout(dropout)
 
     
     def forward(self, x):
-        return self.proj(torch.cat([h(x) for h in self.heads], dim=-1))
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+        out = self.dropout(out)
+        return out
 
 
 class FeedForward(nn.Module):
@@ -111,11 +121,29 @@ class FeedForward(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(n_emb, 4 * n_emb),
             nn.ReLU(),
-            nn.Linear(4 * n_emb, n_emb)
+            nn.Linear(4 * n_emb, n_emb),
+            nn.Dropout(dropout)
         )
 
     def forward(self, x):
         return self.net(x)
+
+
+class LayerNorm:
+    def __init__(self, dim, eps=1e-5, momentum=0.1):
+        self.eps = eps
+        self.gamma = torch.ones(dim)
+        self.beta = torch.zeros(dim)
+
+    def __call__(self, x):
+        xmean = x.mean(1, keepdim=True)                  # batch mean
+        xvar = x.var(1, keepdim=True)                    # batch var
+        xhat = (x - xmean) / torch.sqrt(xvar + self.eps) # normalize unit var
+        self.out = self.gamma * xhat + self.beta
+        return self.out
+    
+    def parameters(self):
+        return [self.gamma, self.beta]
 
 
 class Block(nn.Module):
@@ -125,11 +153,13 @@ class Block(nn.Module):
         head_size = n_emb // n_head
         self.sa = MultiHeadAttention(n_head, head_size)
         self.ffwd = FeedForward(n_emb)
+        self.ln1 = nn.LayerNorm(n_emb)
+        self.ln2 = nn.LayerNorm(n_emb)
 
 
     def forward(self, x):
-        x = x + self.sa(x)
-        x = x + self.ffwd(x)
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
         return x
 
 
@@ -140,14 +170,9 @@ class BigramLanguageModel(nn.Module):
         # each token directly reads off the logits from the next token from lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_emb)
         self.position_embedding_table = nn.Embedding(block_size, n_emb)
-        # self.sa_heads = MultiHeadAttention(4, n_emb//4)
-        # self.ffwd = FeedForward(n_emb=n_emb)
-        self.blocks = nn.Sequential(
-            Block(n_emb, n_head=4),
-            Block(n_emb, n_head=4),
-            Block(n_emb, n_head=4)
-        ) 
-        self.lm_head = nn.Linear(n_emb, vocab_size)
+        self.blocks = nn.Sequential(*[Block(n_emb, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_emb) # final layer norm
+        self.lm_head = nn.Linear(n_emb, vocab_size) 
 
     
     def forward(self, idx, targets=None):
@@ -192,7 +217,7 @@ m = model.to(device)
 
 # training_loop
 optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
-for iter in range(max_iters):
+for iter in tqdm(range(max_iters)):
     # once every 300 epochs printing the lossses
     if iter % eval_interval == 0:
         losses = estimate_loss()
